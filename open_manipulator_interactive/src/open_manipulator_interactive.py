@@ -4,85 +4,91 @@ import rospy
 import open_manipulator_msgs.srv
 
 from geometry_msgs.msg import Pose
-from open_manipulator_msgs.msg import OpenManipulatorState
+from sensor_msgs.msg import JointState
+from open_manipulator_msgs.msg import OpenManipulatorState, KinematicsPose
 
 class Director(object):
 
     def __init__(self):
-        
-        self.joint_name = ["joint1","joint2","joint3","joint4"]
 
-        self.srv_name = []
-        self.srv_position = []
+        # --- Joint Space Variables
+        self.joint_name = ["joint1","joint2","joint3","joint4","gripper"]
+        self.joint_position = [0.00,-1.05,0.35,0.70,0.01]
 
-        self.positions = {
+        self.current_joint_position = JointState()
+
+        self.joint_positions = {
             "home": [0.00,-1.05,0.35,0.70],
-            "one": [-0.35,0.62,0.67,-1.26],
-            "two": [-0.35,-0.07,0.51,-0.39],
-            "three": [0.39,-0.30,0.72,-0.33],
             "gripper_open": [0.01],
             "gripper_closed": [-0.01],
         }
 
-        self.sequence = ["home", "gripper_open", "one", "gripper_closed", "two", "three", "gripper_open"]
 
-        self.path_time = 2.0
-        self.extra_time =0.25
+        # --- Task Space Variables
 
+        self.task_srv_name = "gripper"
+        self.task_srv_position = [0.287, 0.0, 0.239]
+
+        self.current_task_pose = Pose()
+        
+        self.task_positions = {
+            "home": [0.136, 0.0, 0.236],
+
+            "high_1": [0.230, -0.115, 0.195],
+            "high_2": [0.230, 0.0, 0.195],
+            "high_3": [0.230, 0.115, 0.195],
+
+            "mid_1": [0.230, -0.115, 0.150],
+            "mid_2": [0.230, 0.0, 0.150],
+            "mid_3": [0.230, 0.115, 0.150],
+
+            "low_1": [0.230, -0.115, 0.050],
+            "low_2": [0.230, 0.0, 0.050],
+            "low_3": [0.230, 0.115, 0.050],
+        }
+
+
+        # --- ROS Parameters
         rospy.init_node("director_node")
+        
+        self.path_time = 3.0
+        self.extra_time = 0.1
 
         self.freq = 10
         self.rate = rospy.Rate(self.freq)
 
+        # --- Robot State Parameter
         self.robot_moving = False
         self.actuator_enable = False
 
-        self.last_grip = False
 
         # --- ROS Topics
-        self.posSubscriber = rospy.Subscriber("/states",OpenManipulatorState, 
-                                              self.update_manipulator_state)
-        rospy.sleep(0.005)
+        self.stateSubscriber = rospy.Subscriber("/states",OpenManipulatorState, 
+                                              self.manipulator_state_callback)
+        self.poseSubscriber = rospy.Subscriber("/gripper/kinematics_pose",KinematicsPose, 
+                                              self.kinematics_pose_callback)
+        self.jointSubscriber = rospy.Subscriber("/joint_states",JointState, 
+                                              self.joint_states_callback)
+
 
         # --- ROS Services
         rospy.wait_for_service("goal_joint_space_path")
         rospy.wait_for_service("goal_tool_control")
+        rospy.wait_for_service("goal_task_space_path_position_only")
         
         self.goal_joint_space_path = rospy.ServiceProxy("goal_joint_space_path",
-                                                   open_manipulator_msgs.srv.SetJointPosition)
+                                                        open_manipulator_msgs.srv.SetJointPosition)
 
         self.goal_tool_control = rospy.ServiceProxy("goal_tool_control",
-                                                   open_manipulator_msgs.srv.SetJointPosition)
+                                                    open_manipulator_msgs.srv.SetJointPosition)
+        
+        self.goal_task_space_path_position_only = rospy.ServiceProxy("goal_task_space_path_position_only", 
+                                                                     open_manipulator_msgs.srv.SetKinematicsPose)
+        
+        rospy.sleep(0.25)
         
 
-    def update_joint_position(self,key):
-
-        try:
-            if "gripper" in key:
-                self.srv_name = self.joint_name + ["gripper"]
-                
-                if self.last_grip:
-                    self.srv_position[-1] = self.positions[key]
-
-                else:
-                    self.srv_position = self.srv_position + self.positions[key]
-
-                self.last_grip = True
-
-                return self.last_grip
-
-            else:
-                self.srv_name = self.joint_name
-                self.srv_position = self.positions[key]
-                self.last_grip = False
-
-                return self.last_grip
-        
-        except KeyError:
-            print("Step not defined in directory.")
-
-
-    def update_manipulator_state(self,msg):
+    def manipulator_state_callback(self,msg):
 
         if msg.open_manipulator_moving_state == '"IS_MOVING"':
             self.robot_moving = True
@@ -95,12 +101,51 @@ class Director(object):
             self.actuator_enable = False
 
 
-    def send_joint_position(self):
+    def kinematics_pose_callback(self,msg):
+        self.current_task_pose.position = msg.pose.position
+        self.current_task_pose.orientation = msg.pose.orientation
+
+
+    def joint_states_callback(self,msg):
+        self.current_joint_position.name = msg.name
+        self.current_joint_position.position = list(msg.position)
+
+
+    def send_tool_joint_position(self,tool_state):
+        
+        req = open_manipulator_msgs.srv.SetJointPositionRequest()
+
+        req.joint_position.joint_name = self.current_joint_position.name
+
+        if tool_state:
+            req.joint_position.position = self.current_joint_position.position[:-1] + [0.01]
+        else:
+            req.joint_position.position = self.current_joint_position.position[:-1] + [-0.01]
+
+        req.path_time = self.path_time
+
+        if not self.robot_moving and self.actuator_enable:
+
+            try:
+                self.goal_tool_control(req)
+
+                rospy.loginfo("Request sent succesfully.")
+                rospy.sleep(self.path_time + self.extra_time)
+            
+            except:
+                rospy.logerr("Request failed.")
+
+        else:
+            rospy.logerr("Actuators are disabled. Request canceled.")
+
+
+    def send_goal_joint_position(self, key):
 
         req = open_manipulator_msgs.srv.SetJointPositionRequest()
         
-        req.joint_position.joint_name = self.srv_name
-        req.joint_position.position = self.srv_position
+        # --- Only from joint_1 to joint_4
+        req.joint_position.joint_name = self.joint_name[:-1]
+        req.joint_position.position = self.joint_positions[key]
 
         req.path_time = self.path_time
 
@@ -108,6 +153,7 @@ class Director(object):
 
             try:
                 self.goal_joint_space_path(req)
+
                 rospy.loginfo("Request sent succesfully.")
                 rospy.sleep(self.path_time + self.extra_time)
             
@@ -118,19 +164,35 @@ class Director(object):
             rospy.logerr("Actuators are disabled. Request canceled.")
 
 
-    def send_tool_position(self):
+    def send_goal_task_position(self, key):
 
-        req = open_manipulator_msgs.srv.SetJointPositionRequest()
-        
-        req.joint_position.joint_name = self.srv_name
-        req.joint_position.position = self.srv_position
+        # --- Initialize a new Pose() instance
+
+        goal_pose = Pose()
+
+        goal_pose.position.x = self.task_positions[key][0]
+        goal_pose.position.y = self.task_positions[key][1]
+        goal_pose.position.z = self.task_positions[key][2]
+
+        goal_pose.orientation.x = 0
+        goal_pose.orientation.y = 0
+        goal_pose.orientation.z = 0
+        goal_pose.orientation.w = 1
+
+        # --- ROS service
+
+        req = open_manipulator_msgs.srv.SetKinematicsPoseRequest()
+
+        req.end_effector_name = self.task_srv_name
+
+        req.kinematics_pose.pose = goal_pose
 
         req.path_time = self.path_time
 
         if not self.robot_moving and self.actuator_enable:
-            
+
             try:
-                self.goal_tool_control(req)
+                self.goal_task_space_path_position_only(req)
                 rospy.loginfo("Request sent succesfully.")
                 rospy.sleep(self.path_time + self.extra_time)
             
@@ -139,24 +201,14 @@ class Director(object):
 
         else:
             rospy.logerr("Actuators are disabled. Request canceled.")
-        
-        
-def main():
 
+
+def main():
+    
     director = Director()
 
     while not rospy.is_shutdown():
+        pass
 
-        if director.actuator_enable:
-            for key in director.sequence:
-
-                uses_tool = director.update_joint_position(key)
-
-                if(uses_tool):
-                    director.send_tool_position()
-                else:
-                    director.send_joint_position()
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
